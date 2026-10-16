@@ -1,0 +1,10 @@
+{
+  "name": "dictate",
+  "description": "Speak a prompt with /v. Records your microphone, stops when you stop talking, and transcribes with local Whisper (faster-whisper) or a Whisper server you name. Nothing leaves the machine.",
+  "version": "0.1.0",
+  "author": { "name": "AlaboMPJ" },
+  "homepage": "https://github.com/AlaboMPJ/dictate",
+  "repository": "https://github.com/AlaboMPJ/dictate",
+  "license": "MIT",
+  "keywords": ["voice", "dictation", "speech-to-text", "whisper", "faster-whisper", "local"]
+}

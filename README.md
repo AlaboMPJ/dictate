@@ -1,6 +1,6 @@
 # dictate
 
-Speak a prompt to Claude Code. Type `/v`, talk, stop talking, and what you said arrives as your prompt.
+Speak a prompt to Claude Code. Type `/dictate:v`, talk, stop talking, and what you said arrives as your prompt.
 
 Recording and transcription happen on your machine: Whisper runs locally through faster-whisper, or on a Whisper server you name. No audio goes anywhere else.
 
@@ -14,17 +14,29 @@ Recording and transcription happen on your machine: Whisper runs locally through
 
 ## Install
 
-You need Python 3.9+ and ffmpeg on your PATH.
+You need Python 3.9+, ffmpeg on your PATH, and faster-whisper:
+
+```
+pip install faster-whisper numpy
+```
+
+Then, in Claude Code (2.1.275 or later):
+
+```
+/plugin install dictate --marketplace AlaboMPJ/dictate
+```
+
+Type `/dictate:v` and speak. The plugin runs its own copy of the script, so nothing needs to go on your PATH.
+
+Without the plugin system, install by hand:
 
 ```
 git clone https://github.com/AlaboMPJ/dictate
-cd dictate
-pip install faster-whisper numpy
-ln -s "$PWD/dictate" ~/.local/bin/dictate          # anywhere on your PATH
-mkdir -p ~/.claude/commands && cp commands/v.md ~/.claude/commands/
+ln -s "$PWD/dictate/dictate" ~/.local/bin/dictate
+mkdir -p ~/.claude/commands && sed 's#${CLAUDE_PLUGIN_ROOT}/dictate#dictate#g' dictate/commands/v.md > ~/.claude/commands/v.md
 ```
 
-Then in Claude Code, type `/v` and speak.
+which gives you `/v`.
 
 On WSL, recording goes through the Windows ffmpeg (`ffmpeg.exe` on the Windows PATH), because the microphone belongs to Windows. The waveform window needs Windows Python with Pillow (`pip install pillow` in Windows).
 

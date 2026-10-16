@@ -1,0 +1,16 @@
+{
+  "name": "dictate",
+  "description": "dictate: speak a prompt to Claude Code with local Whisper.",
+  "owner": {
+    "name": "AlaboMPJ"
+  },
+  "plugins": [
+    {
+      "name": "dictate",
+      "description": "Speak a prompt with /v, transcribed by local Whisper. Nothing leaves the machine.",
+      "source": "./",
+      "category": "productivity",
+      "homepage": "https://github.com/AlaboMPJ/dictate"
+    }
+  ]
+}
