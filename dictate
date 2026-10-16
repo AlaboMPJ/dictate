@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""dictate: speak a prompt, get text back, on your own machine.
+
+Records your microphone, stops by itself when you stop talking, and transcribes the take
+with Whisper running locally (faster-whisper), or with a Whisper server you name. Nothing
+is sent anywhere else. Built for Claude Code: the `/v` command in commands/v.md runs it and
+hands Claude what you said.
+
+  dictate                   record, stop on ~2.5 s of quiet, print the transcript
+  dictate --mics            list microphones
+  dictate --mic "NAME"      use that microphone (or save one in ~/.config/dictate/mic)
+  dictate --file X.wav      transcribe a file instead of recording
+  dictate --last            transcribe the newest saved take (every take is kept on disk)
+
+Settings, all optional:
+  DICTATE_MODEL             faster-whisper model, default "small" (tiny, base, small, medium, large-v3)
+  DICTATE_WHISPER_URL       a Whisper server instead, POST {url}/api/v1/whisper/transcribe
+  ~/.config/dictate/vocab.txt   words Whisper should expect (names, jargon), passed as its prompt
+  DICTATE_HOME              where takes and the transcript log go, default ~/.local/share/dictate
+
+Every take is written to disk as it is recorded, so a crash or a killed process never loses
+what you said, and every raw transcript is appended to log.jsonl.
+"""
+import array, base64, datetime, io, json, math, os, platform, shutil, subprocess, sys, threading, time, urllib.request, wave
+
+HOME = os.path.expanduser(os.environ.get("DICTATE_HOME", "~/.local/share/dictate"))
+CONF = os.path.expanduser("~/.config/dictate")
+MIC_FILE = os.path.join(CONF, "mic")
+VOCAB_FILE = os.path.join(CONF, "vocab.txt")
+TAKES = os.path.join(HOME, "takes")
+LOG = os.path.join(HOME, "log.jsonl")
+SR = 16000
+CHUNK = SR // 10            # 100 ms
+WAIT_START = 10.0           # seconds to wait for the first word
+STOP_SILENCE = 2.5          # seconds of quiet that end a take (1.6 cut thinking pauses short)
+MAX_LEN = 180.0
+
+WSL = "microsoft" in platform.release().lower()
+WIN = sys.platform == "win32"
+MAC = sys.platform == "darwin"
+# Under WSL the microphone belongs to Windows, so the Windows ffmpeg records it.
+FF = "ffmpeg.exe" if WSL else "ffmpeg"
+
+
+def fail(msg):
+    if GUI:
+        GUI.send("state error " + msg)
+        GUI.close()
+    sys.exit("dictate: " + msg)
+
+
+def need_ffmpeg():
+    if not shutil.which(FF):
+        fail("%s is not on PATH. Install ffmpeg%s." % (FF, " for Windows" if WSL else ""))
+
+
+# ---- microphones, per platform ------------------------------------------
+def mics():
+    need_ffmpeg()
+    if WSL or WIN:
+        out = subprocess.run([FF, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+                             capture_output=True, text=True, errors="replace").stderr
+        return [l.split('"')[1] for l in out.splitlines() if l.rstrip().endswith("(audio)") and '"' in l]
+    if MAC:
+        out = subprocess.run([FF, "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+                             capture_output=True, text=True, errors="replace").stderr
+        names, audio = [], False
+        for l in out.splitlines():
+            if "audio devices" in l:
+                audio = True
+            elif audio and "] [" in l:
+                names.append(l.split("] ", 2)[-1].strip())
+        return names
+    out = subprocess.run(["pactl", "list", "short", "sources"], capture_output=True, text=True).stdout \
+        if shutil.which("pactl") else ""
+    return [l.split("\t")[1] for l in out.splitlines() if "\t" in l and ".monitor" not in l] or ["default"]
+
+
+def pick_mic(arg):
+    if arg:
+        return arg
+    try:
+        m = open(MIC_FILE).read().strip()
+        if m:
+            return m
+    except OSError:
+        pass
+    ms = mics()
+    if not ms:
+        fail("no microphone found. List them with `dictate --mics`.")
+    return ms[0]
+
+
+def ffmpeg_input(mic):
+    if WSL or WIN:
+        return ["-f", "dshow", "-audio_buffer_size", "50", "-i", "audio=" + mic]
+    if MAC:
+        return ["-f", "avfoundation", "-i", ":" + mic]
+    return ["-f", "pulse", "-i", mic]
+
+
+def beep(hz):
+    """A short beep, fired and forgotten so it never delays the recording."""
+    try:
+        if WSL or WIN:
+            subprocess.Popen(["powershell.exe" if WSL else "powershell", "-NoProfile", "-c", "[console]::beep(%d,140)" % hz],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            sys.stderr.write("\a"); sys.stderr.flush()
+    except OSError:
+        pass
+
+
+# ---- the window (Windows and WSL; optional, recording never depends on it) --
+class Gui:
+    def __init__(self):
+        self.stop = self.cancel = False
+        self.p = None
+        if os.environ.get("DICTATE_NOGUI") or not (WSL or WIN):
+            return
+        here = os.path.dirname(os.path.realpath(__file__))
+        gui = os.path.join(here, "gui.py")
+        if not os.path.exists(gui):
+            return
+        try:
+            if WSL:
+                gui = subprocess.run(["wslpath", "-w", gui], capture_output=True, text=True).stdout.strip()
+            self.p = subprocess.Popen(["python.exe" if WSL else sys.executable, gui], stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+            threading.Thread(target=self._read, daemon=True).start()
+        except OSError:
+            self.p = None
+
+    def _read(self):
+        for line in self.p.stdout:
+            if line.strip() == "stop":
+                self.stop = True
+            elif line.strip() == "cancel":
+                self.cancel = True
+
+    def send(self, line):
+        if self.p and self.p.poll() is None:
+            try:
+                self.p.stdin.write(line.replace("\n", " ") + "\n")
+                self.p.stdin.flush()
+            except OSError:
+                pass
+
+    def close(self):
+        if self.p:
+            try:
+                self.p.stdin.close()
+            except OSError:
+                pass
+
+
+GUI = None
+
+
+def envelope(buf):
+    """Four 25 ms RMS levels per 100 ms chunk, -70..-15 dBFS mapped to 0..1, for the window."""
+    a = array.array("h", buf)
+    n = max(1, len(a) // 4)
+    out = []
+    for i in range(0, n * 4, n):
+        seg = a[i:i + n]
+        r = math.sqrt(sum(x * x for x in seg) / max(1, len(seg))) / 32768.0
+        out.append("%.3f" % min(1.0, max(0.0, (20 * math.log10(r + 1e-9) + 70) / 55)))
+    return " ".join(out)
+
+
+def rms_db(buf):
+    a = array.array("h", buf)
+    if not a:
+        return -120.0
+    return 10 * math.log10(sum(x * x for x in a) / len(a) / (32768.0 ** 2) + 1e-12)
+
+
+def record(mic):
+    need_ffmpeg()
+    p = subprocess.Popen([FF, "-nostdin", "-hide_banner", "-loglevel", "error"] + ffmpeg_input(mic) +
+                         ["-ac", "1", "-ar", str(SR), "-f", "s16le", "-"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    os.makedirs(TAKES, exist_ok=True)
+    take = wave.open(os.path.join(TAKES, datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + ".wav"), "wb")
+    take.setnchannels(1); take.setsampwidth(2); take.setframerate(SR)
+    pcm, noise, started, quiet, peak, run = bytearray(), [], False, 0.0, -120.0, 0
+    try:
+        while True:
+            buf = p.stdout.read(CHUNK * 2)
+            if not buf:
+                err = p.stderr.read().decode("utf-8", "replace").strip()
+                fail("the microphone did not open (%s). %s List them with `dictate --mics`, "
+                     "save one in %s." % (mic, err[-300:], MIC_FILE))
+            pcm += buf
+            take.writeframes(buf)              # on disk now, whatever happens to this process
+            db = rms_db(buf)
+            el = len(pcm) / 2 / SR
+            if GUI:
+                if GUI.cancel:
+                    p.kill()
+                    sys.exit("dictate: cancelled")
+                if el >= 0.8:
+                    GUI.send("wave " + envelope(buf))
+            # Many microphones open with a short burst of startup noise: skip it, then take the
+            # room's level from the next 0.4 s, so "loud" is measured against this room.
+            if el < 0.8:
+                continue
+            if el < 1.2:
+                noise.append(db)
+                if len(noise) == 4:
+                    beep(880)                  # ready: speak now
+                    if GUI:
+                        GUI.send("state listening Listening. Speak now.")
+                continue
+            floor = sorted(noise)[len(noise) // 2]
+            loud = db > max(floor + 14, -62)   # relative to the room: quiet mics refuse a fixed bar
+            peak = max(peak, db)
+            if not started:
+                run = run + 1 if loud else 0
+                if run >= 3:                   # 0.3 s of sound, so a click or a bump is not a start
+                    started = True
+                    if GUI:
+                        GUI.send("state hearing Hearing you")
+                elif GUI and GUI.stop:
+                    fail("stopped before anything was said")
+                elif el > WAIT_START:
+                    fail("heard nothing for %d s on %s (room %.0f dB, loudest %.0f dB). If you spoke, "
+                         "the mic is muted or its input level is near zero." % (WAIT_START, mic, floor, peak))
+            else:
+                quiet = 0.0 if loud else quiet + 0.1
+                if quiet >= STOP_SILENCE or el >= MAX_LEN or (GUI and GUI.stop):
+                    beep(440)                  # stopped listening
+                    break
+    finally:
+        p.kill()
+        take.close()
+    return bytes(pcm)
+
+
+def to_wav(pcm):
+    b = io.BytesIO()
+    with wave.open(b, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(SR); w.writeframes(pcm)
+    return b.getvalue()
+
+
+def vocab():
+    try:
+        return open(VOCAB_FILE).read().strip() or None
+    except OSError:
+        return None
+
+
+# ---- transcription --------------------------------------------------------
+def transcribe(wav):
+    url = os.environ.get("DICTATE_WHISPER_URL")
+    if url:
+        body = json.dumps({"audio": base64.b64encode(wav).decode(), "language": None,
+                           "word_timestamps": False, "initial_prompt": vocab()}).encode()
+        req = urllib.request.Request(url.rstrip("/") + "/api/v1/whisper/transcribe", data=body,
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=240) as r:
+                text = (json.loads(r.read().decode()).get("text") or "").strip()
+        except urllib.error.HTTPError as e:
+            fail("the Whisper server refused it: %s %s" % (e.code, e.read()[:200].decode("utf-8", "replace")))
+        except Exception as e:
+            fail("the Whisper server at %s is not answering (%s)" % (url, type(e).__name__))
+    else:
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            fail("faster-whisper is not installed: pip install faster-whisper "
+                 "(or set DICTATE_WHISPER_URL to a Whisper server)")
+        import numpy as np
+        name = os.environ.get("DICTATE_MODEL", "small")
+        with wave.open(io.BytesIO(wav)) as w:
+            rate, raw = w.getframerate(), w.readframes(w.getnframes())
+        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        if rate != SR:
+            audio = np.interp(np.arange(0, len(audio), rate / SR), np.arange(len(audio)), audio).astype(np.float32)
+        # "auto" picks the GPU whenever a driver is present and then fails at the first segment
+        # if the CUDA libraries are not installed (libcublas, cuDNN). Fall back to the CPU and say so.
+        def run(device, ctype):
+            segs, _ = WhisperModel(name, device=device, compute_type=ctype).transcribe(audio, initial_prompt=vocab(), vad_filter=False)
+            return " ".join(s.text.strip() for s in segs).strip()
+        try:
+            text = run("auto", "auto")
+        except RuntimeError as e:
+            if not any(k in str(e).lower() for k in ("cuda", "cublas", "cudnn")):
+                raise
+            sys.stderr.write("dictate: GPU libraries missing (%s), using the CPU\n" % str(e).split("\n")[0][:80])
+            text = run("cpu", "int8")
+    if not text:
+        fail("Whisper heard nothing in that recording")
+    return text
+
+
+def main():
+    a = sys.argv[1:]
+    if "-h" in a or "--help" in a:
+        print(__doc__.strip())
+        return
+    if "--mics" in a:
+        cur = None
+        try:
+            cur = open(MIC_FILE).read().strip()
+        except OSError:
+            pass
+        for m in mics():
+            print(("* " if m == cur else "  ") + m)
+        return
+    mic = a[a.index("--mic") + 1] if "--mic" in a else None
+    if "--last" in a:
+        files = sorted(f for f in os.listdir(TAKES) if f.endswith(".wav")) if os.path.isdir(TAKES) else []
+        if not files:
+            sys.exit("dictate: no saved takes in %s" % TAKES)
+        src = os.path.join(TAKES, files[-1])
+        wav = open(src, "rb").read()
+    elif "--file" in a:
+        src = a[a.index("--file") + 1]
+        wav = open(src, "rb").read()
+    else:
+        global GUI
+        GUI = Gui()
+        mic = pick_mic(mic)
+        wav, src = to_wav(record(mic)), mic
+        GUI.send("state converting Converting your speech")
+    text = transcribe(wav)
+    if GUI:
+        GUI.send("state done " + text)
+        GUI.close()
+    os.makedirs(HOME, exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write(json.dumps({"at": datetime.datetime.now().isoformat(timespec="seconds"), "source": src, "raw": text}) + "\n")
+    print(text)
+
+
+if __name__ == "__main__":
+    main()
